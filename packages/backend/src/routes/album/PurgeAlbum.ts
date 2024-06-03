@@ -1,6 +1,29 @@
 import type { FastifyReply } from 'fastify';
+import { z } from 'zod';
 import prisma from '@/structures/database.js';
 import type { RequestWithUser } from '@/structures/interfaces.js';
+import { http4xxErrorSchema } from '@/structures/schemas/HTTP4xxError.js';
+import { http5xxErrorSchema } from '@/structures/schemas/HTTP5xxError.js';
+import { responseMessageSchema } from '@/structures/schemas/ResponseMessage.js';
+import { deleteFiles } from '@/utils/File.js';
+
+export const schema = {
+	summary: 'Purge album',
+	description: 'Purges an album and all its files',
+	tags: ['Albums'],
+	params: z
+		.object({
+			uuid: z.string().describe('The uuid of the album.')
+		})
+		.required(),
+	response: {
+		200: z.object({
+			message: responseMessageSchema
+		}),
+		'4xx': http4xxErrorSchema,
+		'5xx': http5xxErrorSchema
+	}
+};
 
 export const options = {
 	url: '/album/:uuid/purge',
@@ -38,7 +61,13 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 			select: {
 				files: {
 					select: {
-						id: true
+						id: true,
+						isS3: true,
+						isWatched: true,
+						name: true,
+						quarantine: true,
+						quarantineFile: true,
+						uuid: true
 					}
 				}
 			}
@@ -59,6 +88,10 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 				uuid
 			}
 		});
+
+		if (albumFiles) {
+			await deleteFiles({ files: albumFiles.files });
+		}
 
 		return await res.send({
 			message: 'Successfully deleted the album'

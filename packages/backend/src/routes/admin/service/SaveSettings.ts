@@ -1,11 +1,37 @@
-import process from 'node:process';
 import type { FastifyReply } from 'fastify';
-import { getHtmlBuffer } from '@/main.js';
+import { z } from 'zod';
 import prisma from '@/structures/database.js';
 import type { RequestWithUser } from '@/structures/interfaces.js';
+import { http4xxErrorSchema } from '@/structures/schemas/HTTP4xxError.js';
+import { http5xxErrorSchema } from '@/structures/schemas/HTTP5xxError.js';
+import { responseMessageSchema } from '@/structures/schemas/ResponseMessage.js';
 import type { SETTINGS } from '@/structures/settings.js';
 import { loadSettings } from '@/structures/settings.js';
 import { updateCheck, startUpdateCheckSchedule, stopUpdateCheckSchedule } from '@/utils/UpdateCheck.js';
+
+export const schema = {
+	summary: 'Save settings',
+	description: 'Save the chibisafe instance settings',
+	tags: ['Server'],
+	body: z.object({
+		settings: z
+			.array(
+				z.object({
+					key: z.string().describe('The key of the setting.'),
+					value: z.coerce.string().describe('The value of the setting.'),
+					type: z.string().describe('The type of the setting.')
+				})
+			)
+			.describe('Items to save in the settings.')
+	}),
+	response: {
+		200: z.object({
+			message: responseMessageSchema
+		}),
+		'4xx': http4xxErrorSchema,
+		'5xx': http5xxErrorSchema
+	}
+};
 
 export const options = {
 	url: '/admin/service/settings',
@@ -51,8 +77,6 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 		await res.send({ message: 'Settings updated' });
 		// Refresh the instance settings
 		await loadSettings(true);
-		// If running in production, we need to update the html buffer
-		if (process.env.NODE_ENV === 'production') await getHtmlBuffer();
 
 		// Option is enabled, but the schedule is not running
 		if (!parsedSettings.disableUpdateCheck && !updateCheck.active) {

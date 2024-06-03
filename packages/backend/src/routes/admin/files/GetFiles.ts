@@ -1,8 +1,38 @@
 import type { Prisma } from '@prisma/client';
 import type { FastifyReply } from 'fastify';
+import { z } from 'zod';
 import prisma from '@/structures/database.js';
 import type { RequestWithUser, ExtendedFile } from '@/structures/interfaces.js';
+import { booleanSchema } from '@/structures/schemas/Boolean.js';
+import { fileAsAdminSchema } from '@/structures/schemas/FileAsAdmin.js';
+import { fileAsUserSchema } from '@/structures/schemas/FileAsUser.js';
+import { http4xxErrorSchema } from '@/structures/schemas/HTTP4xxError.js';
+import { http5xxErrorSchema } from '@/structures/schemas/HTTP5xxError.js';
+import { queryLimitSchema } from '@/structures/schemas/QueryLimit.js';
+import { queryPageSchema } from '@/structures/schemas/QueryPage.js';
 import { constructFilePublicLink } from '@/utils/File.js';
+
+export const schema = {
+	summary: 'Get all files',
+	description: 'Gets all files as admin',
+	tags: ['Files'],
+	query: z.object({
+		publicOnly: booleanSchema.describe('Whether to only get public files.'),
+		page: queryPageSchema,
+		limit: queryLimitSchema,
+		quarantine: booleanSchema.describe('Whether to only get quarantined files.'),
+		search: z.string().optional().describe('The text you want to search within all files.')
+	}),
+	response: {
+		200: z.object({
+			message: z.string().describe('The response message.'),
+			files: z.array(fileAsAdminSchema).or(z.array(fileAsUserSchema)),
+			count: z.number().describe('The total count of files.')
+		}),
+		'4xx': http4xxErrorSchema,
+		'5xx': http5xxErrorSchema
+	}
+};
 
 export const options = {
 	url: '/admin/files',
@@ -15,14 +45,16 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 		publicOnly = false,
 		page = 1,
 		limit = 50,
-		quarantine = false
-	} = req.query as { limit?: number; page?: number; publicOnly: boolean; quarantine?: boolean };
+		quarantine = false,
+		search = ''
+	} = req.query as { limit?: number; page?: number; publicOnly: boolean; quarantine?: boolean; search?: string };
 
 	const dbSearchObject: Prisma.filesCountArgs = {
 		where: {
 			quarantine
 		}
 	};
+
 	const dbObject: Prisma.filesFindManyArgs = {
 		where: {
 			quarantine
@@ -44,7 +76,9 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 				select: {
 					name: true
 				}
-			}
+			},
+			isS3: true,
+			isWatched: true
 		},
 		orderBy: {
 			id: 'desc'
@@ -77,19 +111,74 @@ export const run = async (req: RequestWithUser, res: FastifyReply) => {
 		};
 	}
 
+	if (search) {
+		dbSearchObject.where = {
+			...dbSearchObject.where,
+			OR: [
+				{
+					name: {
+						contains: search
+					}
+				},
+				{
+					original: {
+						contains: search
+					}
+				},
+				{
+					ip: {
+						equals: search
+					}
+				},
+				{
+					uuid: {
+						equals: search
+					}
+				}
+			]
+		};
+
+		dbObject.where = {
+			...dbObject.where,
+			OR: [
+				{
+					name: {
+						contains: search
+					}
+				},
+				{
+					original: {
+						contains: search
+					}
+				},
+				{
+					ip: {
+						equals: search
+					}
+				},
+				{
+					uuid: {
+						equals: search
+					}
+				}
+			]
+		};
+	}
+
 	const count = await prisma.files.count(dbSearchObject);
 	const files = (await prisma.files.findMany(dbObject)) as ExtendedFile[] | [];
-
-	if (!files) {
-		void res.notFound('No files exist');
-		return;
-	}
 
 	const readyFiles = [];
 	for (const file of files) {
 		readyFiles.push({
 			...file,
-			...constructFilePublicLink(req, quarantine ? file.quarantineFile.name : file.name, quarantine)
+			...constructFilePublicLink({
+				req,
+				fileName: quarantine ? file.quarantineFile.name : file.name,
+				quarantine,
+				isS3: file.isS3,
+				isWatched: file.isWatched
+			})
 		});
 	}
 

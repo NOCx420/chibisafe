@@ -1,8 +1,10 @@
-import path from 'node:path';
+import path, { basename, extname } from 'node:path';
 import process from 'node:process';
 import { URL, fileURLToPath } from 'node:url';
+import { DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { Blake3Hasher } from '@napi-rs/blake-hash';
+import slugify from '@sindresorhus/slugify';
 import Zip from 'adm-zip';
-import * as blake3 from 'blake3';
 import type { FastifyRequest } from 'fastify';
 import jetpack from 'fs-jetpack';
 import moment from 'moment';
@@ -12,15 +14,16 @@ import prisma from '@/structures/database.js';
 import type { FileInProgress, RequestUser, User } from '@/structures/interfaces.js';
 import { SETTINGS } from '@/structures/settings.js';
 import { log } from '@/utils/Logger.js';
-import { getFileThumbnail, removeThumbs } from './Thumbnails.js';
+import { generateThumbnails, getFileThumbnail, removeThumbs } from './Thumbnails.js';
 import { getHost } from './Util.js';
 
 const fileIdentifierMaxTries = 5;
 
-const preserveExtensions = [
-	/\.tar\.\w+/i // tarballs
-];
+// const preserveExtensions = [
+// 	/\.tar\.\w+/i // tarballs
+// ];
 export const uploadPath = fileURLToPath(new URL('../../../../uploads', import.meta.url));
+export const watchPath = fileURLToPath(new URL('../../../../uploads/live', import.meta.url));
 export const tmpUploadPath = fileURLToPath(new URL('../../../../uploads/tmp', import.meta.url));
 export const quarantinePath = fileURLToPath(new URL('../../../../uploads/quarantine', import.meta.url));
 
@@ -68,19 +71,81 @@ export const deleteTmpFile = async (uploadPath: string) => {
 	}
 };
 
-export const deleteFile = async (filename: string, deleteFromDB = false) => {
+export const deleteFiles = async ({
+	files,
+	deleteFromDB = false
+}: {
+	deleteFromDB?: boolean;
+	files: {
+		isS3: boolean;
+		isWatched: boolean;
+		name: string;
+		quarantine: boolean;
+		quarantineFile: { name: string } | null;
+		uuid: string;
+	}[];
+}) => {
+	const s3Files = files.filter(file => file.isS3);
+	const localFiles = files.filter(file => !file.isS3);
+
 	try {
-		await jetpack.removeAsync(path.join(uploadPath, filename));
-		await deleteThumbnails(filename);
+		if (s3Files.length) {
+			const { createS3Client } = await import('@/structures/s3.js');
+			const S3Client = createS3Client();
+
+			const command = new DeleteObjectsCommand({
+				Bucket: SETTINGS.S3Bucket,
+				Delete: {
+					Objects: s3Files.map(file => ({
+						Key: file.quarantine ? `quarantine/${file.quarantineFile?.name}` ?? file.name : file.name
+					})),
+					Quiet: true
+				}
+			});
+
+			await S3Client.send(command);
+		}
+
+		if (localFiles.length) {
+			for (const file of localFiles) {
+				if (file.quarantine) {
+					await prisma.files.update({
+						where: {
+							uuid: file.uuid
+						},
+						data: {
+							quarantine: false,
+							quarantineFile: {
+								delete: true
+							}
+						}
+					});
+				}
+
+				await jetpack.removeAsync(
+					path.join(
+						file.quarantine ? quarantinePath : file.isWatched ? watchPath : uploadPath,
+						file.quarantine ? file.quarantineFile?.name ?? file.name : file.name
+					)
+				);
+			}
+		}
+
+		for (const file of files) {
+			await deleteThumbnails(file.name);
+		}
+
 		if (deleteFromDB) {
 			await prisma.files.deleteMany({
 				where: {
-					name: filename
+					uuid: {
+						in: files.map(file => file.uuid)
+					}
 				}
 			});
 		}
 	} catch (error) {
-		log.error(`There was an error removing the file < ${filename} >`);
+		log.error(`There was an error removing one/all of the files < [${files.map(file => file.name).join(', ')}] >`);
 		log.error(error);
 	}
 };
@@ -101,25 +166,7 @@ export const purgeUserFiles = async (userId: number) => {
 			}
 		});
 
-		for (const file of files) {
-			await deleteFile(file.name);
-
-			if (file.quarantine) {
-				await prisma.files.update({
-					where: {
-						uuid: file.uuid
-					},
-					data: {
-						quarantine: false,
-						quarantineFile: {
-							delete: true
-						}
-					}
-				});
-
-				await deleteFile(file.quarantineFile!.name);
-			}
-		}
+		await deleteFiles({ files });
 
 		await prisma.files.deleteMany({
 			where: {
@@ -136,12 +183,13 @@ export const purgePublicFiles = async () => {
 		const files = await prisma.files.findMany({
 			where: {
 				userId: null
+			},
+			include: {
+				quarantineFile: true
 			}
 		});
 
-		for (const file of files) {
-			await deleteFile(file.name);
-		}
+		await deleteFiles({ files });
 
 		await prisma.files.deleteMany({
 			where: {
@@ -158,12 +206,13 @@ export const purgeIpFiles = async (ip: string) => {
 		const files = await prisma.files.findMany({
 			where: {
 				ip
+			},
+			include: {
+				quarantineFile: true
 			}
 		});
 
-		for (const file of files) {
-			await deleteFile(file.name);
-		}
+		await deleteFiles({ files });
 
 		await prisma.files.deleteMany({
 			where: {
@@ -190,19 +239,31 @@ export const createZip = (files: string[], albumUuid: string) => {
 	}
 };
 
-export const constructFilePublicLink = (req: FastifyRequest, fileName: string, quarantine = false) => {
+export const constructFilePublicLink = ({
+	req,
+	fileName,
+	quarantine = false,
+	isS3 = false,
+	isWatched = false
+}: {
+	fileName: string;
+	isS3?: boolean;
+	isWatched?: boolean;
+	quarantine?: boolean;
+	req: FastifyRequest;
+}) => {
 	const host = SETTINGS.serveUploadsFrom ? SETTINGS.serveUploadsFrom : getHost(req);
 	const data = {
-		url: `${host}${quarantine ? '/quarantine' : ''}/${fileName}`,
+		url: isS3
+			? `${SETTINGS.S3PublicUrl || SETTINGS.S3Endpoint}${quarantine ? '/quarantine' : ''}/${fileName}`
+			: `${host}${quarantine ? '/quarantine' : ''}${isWatched ? '/live' : ''}/${fileName}`,
 		thumb: '',
-		thumbSquare: '',
 		preview: ''
 	};
 
 	const { thumb, preview } = getFileThumbnail(fileName) ?? {};
 	if (thumb) {
 		data.thumb = `${host}/thumbs/${thumb}`;
-		data.thumbSquare = `${host}/thumbs/square/${thumb}`;
 		if (preview) {
 			data.preview = `${host}/thumbs/preview/${preview}`;
 		}
@@ -238,6 +299,29 @@ export const checkFileHashOnDB = async (user: RequestUser | User | undefined, fi
 	return null;
 };
 
+export const checkFileNameOnDB = async (user: RequestUser | User | undefined, fileName: string) => {
+	const dbFile = await prisma.files.findFirst({
+		where: {
+			name: fileName,
+			isWatched: true,
+			user: user
+				? {
+						id: user.id
+					}
+				: {}
+		}
+	});
+
+	if (dbFile) {
+		return {
+			file: dbFile,
+			repeated: true
+		};
+	}
+
+	return null;
+};
+
 export const storeFileToDb = async (
 	user: RequestUser | User | undefined,
 	file: FileInProgress,
@@ -254,6 +338,8 @@ export const storeFileToDb = async (
 		size: file.size,
 		hash: file.hash,
 		ip: file.ip,
+		isS3: file.isS3,
+		isWatched: file.isWatched,
 		createdAt: now,
 		editedAt: now
 	};
@@ -290,6 +376,29 @@ export const storeFileToDb = async (
 	}
 };
 
+export const updateFileOnDb = async (user: RequestUser | User | undefined, file: FileInProgress & { uuid: string }) => {
+	const now = moment.utc().toDate();
+
+	const data = {
+		userId: user?.id ?? undefined!,
+		name: file.name,
+		original: file.original,
+		type: file.type,
+		size: file.size,
+		hash: file.hash,
+		ip: file.ip,
+		isS3: file.isS3,
+		isWatched: file.isWatched,
+		createdAt: now,
+		editedAt: now
+	};
+
+	return prisma.files.update({
+		where: { uuid: file.uuid, isWatched: true },
+		data
+	});
+};
+
 export const saveFileToAlbum = async (albumId: number, fileId: number) => {
 	const now = moment.utc().toDate();
 	await prisma.files.update({
@@ -315,54 +424,119 @@ export const saveFileToAlbum = async (albumId: number, fileId: number) => {
 	});
 };
 
-export const getExtension = (filename: string, lower = false): string => {
-	// Always return blank string if the filename does not seem to have a valid extension
-	// Files such as .DS_Store (anything that starts with a dot, without any extension after) will still be accepted
-	if (!/\../.test(filename)) return '';
+// export const getExtension = (filename: string, lower = false): string => {
+// 	// Always return blank string if the filename does not seem to have a valid extension
+// 	// Files such as .DS_Store (anything that starts with a dot, without any extension after) will still be accepted
+// 	if (!/\../.test(filename)) return '';
 
-	let multi = '';
-	let extension = '';
+// 	let multi = '';
+// 	let extension = '';
 
-	// check for multi-archive extensions (.001, .002, and so on)
-	if (/\.\d{3}$/.test(filename)) {
-		multi = filename.slice(filename.lastIndexOf('.') - filename.length);
-		// eslint-disable-next-line no-param-reassign
-		filename = filename.slice(0, filename.lastIndexOf('.'));
-	}
+// 	// check for multi-archive extensions (.001, .002, and so on)
+// 	if (/\.\d{3}$/.test(filename)) {
+// 		multi = filename.slice(filename.lastIndexOf('.') - filename.length);
+// 		// eslint-disable-next-line no-param-reassign
+// 		filename = filename.slice(0, filename.lastIndexOf('.'));
+// 	}
 
-	// check against extensions that must be preserved
-	for (const extPreserve of preserveExtensions) {
-		const match = filename.match(extPreserve);
-		if (match?.[0]) {
-			extension = match[0];
-			break;
-		}
-	}
+// 	// check against extensions that must be preserved
+// 	for (const extPreserve of preserveExtensions) {
+// 		const match = filename.match(extPreserve);
+// 		if (match?.[0]) {
+// 			extension = match[0];
+// 			break;
+// 		}
+// 	}
 
-	if (!extension) {
-		extension = filename.slice(filename.lastIndexOf('.') - filename.length); // path.extname(filename)
-	}
+// 	if (!extension) {
+// 		extension = filename.slice(filename.lastIndexOf('.') - filename.length); // path.extname(filename)
+// 	}
 
-	const str = extension + multi;
-	return lower ? str.toLowerCase() : str;
-};
+// 	const str = extension + multi;
+// 	return lower ? str.toLowerCase() : str;
+// };
 
 export const hashFile = async (uploadPath: string): Promise<string> => {
-	const hash = blake3.createHash();
+	const hasher = new Blake3Hasher();
 	const stream = jetpack.createReadStream(uploadPath);
 	return new Promise((resolve, reject) => {
 		stream.on('data', data => {
-			hash.update(data);
+			hasher.update(data);
 		});
 
 		stream.on('end', () => {
-			resolve(hash.digest('hex'));
-			hash.dispose();
+			resolve(hasher.digest('hex'));
+			hasher.reset();
 		});
 
 		stream.on('error', error => {
 			reject(error);
-			hash.dispose();
+			hasher.reset();
 		});
 	});
+};
+
+export const handleUploadFile = async ({
+	user,
+	ip,
+	upload,
+	album
+}: {
+	album?: number | null | undefined;
+	ip: string;
+	upload: { name: string; path: string; size: string; type: string };
+	user?: RequestUser | User | undefined;
+}) => {
+	// Assign a unique identifier to the file
+	const uniqueIdentifier = await getUniqueFileIdentifier();
+	if (!uniqueIdentifier) throw new Error('Could not generate unique identifier.');
+	const ext = extname(upload.name);
+	let newFilename = `${uniqueIdentifier}${ext}`;
+	if (SETTINGS.generateOriginalFileNameWithIdentifier) {
+		const isLowerCase = !SETTINGS.enableMixedCaseFilenames || process.platform === 'win32';
+		const originalNameWithoutExt = basename(upload.name, ext);
+		newFilename = `${slugify(originalNameWithoutExt, { separator: '_', lowercase: isLowerCase })}-${uniqueIdentifier}${ext}`;
+	}
+
+	log.debug(`> Name for upload: ${newFilename}`);
+
+	// Move file to permanent location
+	const newPath = fileURLToPath(new URL(`../../../../uploads/${newFilename}`, import.meta.url));
+	const file = {
+		name: newFilename,
+		extension: ext,
+		path: newPath,
+		original: upload.name,
+		type: upload.type,
+		size: upload.size,
+		hash: await hashFile(upload.path),
+		ip,
+		isS3: false,
+		isWatched: false
+	};
+
+	let uploadedFile;
+	const fileOnDb = await checkFileHashOnDB(user, file);
+	if (fileOnDb?.repeated) {
+		log.info(
+			`> Tried uploading ${file.original} but already exists on database with identifier: ${fileOnDb.file.name}`
+		);
+		uploadedFile = fileOnDb.file;
+		await deleteTmpFile(upload.path);
+	} else {
+		await jetpack.moveAsync(upload.path, newPath);
+		// Store file in database
+		const savedFile = await storeFileToDb(user ? user : undefined, file, album ? album : undefined);
+
+		uploadedFile = savedFile.file;
+
+		// Generate thumbnails
+		void generateThumbnails({
+			filename: savedFile.file.name,
+			tmp: savedFile.file.isS3,
+			watched: savedFile.file.isWatched
+		});
+	}
+
+	return uploadedFile;
 };

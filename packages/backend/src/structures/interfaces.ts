@@ -40,6 +40,8 @@ export interface FileInProgress {
 	field?: string;
 	hash: string;
 	ip: string;
+	isS3: boolean;
+	isWatched: boolean;
 	name: string;
 	original: string;
 	path: string;
@@ -52,6 +54,8 @@ export interface File {
 	editedAt: Date | null;
 	hash: string;
 	ip: string;
+	isS3: boolean;
+	isWatched: boolean;
 	name: string;
 	original: string;
 	quarantine: boolean;
@@ -72,7 +76,6 @@ export interface FileWithId extends File {
 export interface ExtendedFile extends File {
 	preview?: string;
 	thumb?: string;
-	thumbSquare?: string;
 	url?: string;
 }
 
@@ -103,6 +106,12 @@ export interface Album {
 export interface Settings {
 	// savedStatistics: string[];
 	[key: string]: string[] | boolean | number | string;
+	S3AccessKey: string;
+	S3Bucket: string;
+	S3Endpoint: string;
+	S3PublicUrl: string;
+	S3Region: string;
+	S3SecretKey: string;
 	backgroundImageURL: string;
 	blockNoExtension: boolean;
 	blockedExtensions: string[];
@@ -112,9 +121,12 @@ export interface Settings {
 	disableUpdateCheck: boolean;
 	enableMixedCaseFilenames: boolean;
 	enabledStatistics: string[];
+	generateOriginalFileNameWithIdentifier: boolean;
+	generateThumbnails: boolean;
 	generateZips: boolean;
 	generatedAlbumLength: number;
 	generatedFilenameLength: number;
+	generatedLinksLength: number;
 	logoURL: string;
 	maxSize: number;
 	metaDescription: string;
@@ -122,14 +134,19 @@ export interface Settings {
 	metaKeywords: string;
 	metaTwitterHandle: string;
 	port: number;
+	privacyPolicyPageContent: string;
 	publicMode: boolean;
 	rateLimitMax: number;
 	rateLimitWindow: number;
+	rulesPageContent: string;
 	secret: string;
 	serveUploadsFrom: string;
 	serviceName: string;
 	statisticsCron: string;
+	termsOfServicePageContent: string;
 	updateCheckCron: string;
+	useNetworkStorage: boolean;
+	useUrlShortener: boolean;
 	userAccounts: boolean;
 	usersStorageQuota: number;
 }
